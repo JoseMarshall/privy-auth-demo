@@ -2,18 +2,22 @@ import { PrivyProvider, usePrivy } from '@privy-io/react-auth';
 import { createRoot } from 'react-dom/client';
 import { ApolloClient, InMemoryCache, gql } from '@apollo/client';
 import { ApolloProvider, useMutation, useQuery } from '@apollo/client/react';
-import { HttpLink } from '@apollo/client/link/http';
+import UploadHttpLink from 'apollo-upload-client/UploadHttpLink.mjs';
 import { useState, useEffect } from 'react';
 
-// GraphQL Client
-const httpLink = new HttpLink({
-  uri: 'http://localhost:3333/api/graphql',
-  credentials: 'include', // Include cookies in requests
-});
-
+// GraphQL Client with file upload support
+// UploadHttpLink automatically handles both file uploads and regular requests
+// It detects files and uses multipart form-data, otherwise falls back to JSON
 const client = new ApolloClient({
-  link: httpLink,
   cache: new InMemoryCache(),
+  link: new UploadHttpLink({
+    uri: 'http://localhost:3333/api/graphql',
+    credentials: 'include',
+    headers: {
+      // Apollo upload client will automatically set Content-Type for multipart
+      // Don't manually set it as it needs the boundary parameter
+    },
+  }),
 });
 
 type MeQuery = {
@@ -39,6 +43,41 @@ type LogoutMutation = {
 };
 
 type LogoutMutationVariables = {};
+
+type UploadFileMutation = {
+  uploadFile: {
+    filename: string;
+    mimetype: string;
+    size: number;
+    url: string;
+  };
+};
+
+type UploadFileMutationVariables = {
+  file: File;
+};
+
+type UpdateUserMutation = {
+  updateUser: {
+    id: string;
+    displayName: string;
+    username: string;
+    profilePictureUrl: string;
+    bio: string;
+    createdAt: string;
+    updatedAt: string;
+  };
+};
+
+type UpdateUserMutationVariables = {
+  id: string;
+  input: {
+    displayName?: string;
+    username?: string;
+    profilePictureUrl?: string;
+    bio?: string;
+  };
+};
 
 // GraphQL Mutations and Queries
 const LOGIN_MUTATION = gql`
@@ -75,6 +114,31 @@ const ME_QUERY = gql`
   }
 `;
 
+const UPDATE_USER_MUTATION = gql`
+  mutation UpdateUser($id: ID!, $input: UserUpdateInput!) {
+    updateUser(id: $id, input: $input) {
+      id
+      displayName
+      username
+      profilePictureUrl
+      bio
+      createdAt
+      updatedAt
+    }
+  }
+`;
+
+const UPLOAD_FILE_MUTATION = gql`
+  mutation UploadFile($file: Upload!) {
+    uploadFile(file: $file) {
+      filename
+      mimetype
+      size
+      url
+    }
+  }
+`;
+
 function App() {
   return (
     <ApolloProvider client={client}>
@@ -93,6 +157,166 @@ function App() {
         <AuthComponent />
       </PrivyProvider>
     </ApolloProvider>
+  );
+}
+
+function ProfileImageUpload({
+  userId,
+  currentImageUrl,
+}: {
+  userId: string;
+  currentImageUrl?: string | null;
+}) {
+  const [updateUser] = useMutation<
+    UpdateUserMutation,
+    UpdateUserMutationVariables
+  >(UPDATE_USER_MUTATION);
+  const [uploadFile] = useMutation<
+    UploadFileMutation,
+    UploadFileMutationVariables
+  >(UPLOAD_FILE_MUTATION, {
+    onCompleted: result => {
+      console.log('✅ File uploaded successfully:', result);
+    },
+    onError: error => {
+      console.error('❌ Upload error:', error);
+    },
+  });
+  const [uploading, setUploading] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(
+    currentImageUrl || null
+  );
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    console.log('Selected file:', {
+      name: file.name,
+      type: file.type,
+      size: file.size,
+    });
+
+    // Validate file type
+    if (!file.type.startsWith('image/')) {
+      alert('Please select an image file');
+      return;
+    }
+
+    // Validate file size (5MB max)
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    if (file.size > MAX_FILE_SIZE) {
+      alert(`File size must be less than ${MAX_FILE_SIZE / 1024 / 1024}MB`);
+      return;
+    }
+
+    try {
+      setUploading(true);
+
+      // Create preview
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setPreviewUrl(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+
+      console.log('Starting upload with apollo-upload-client...');
+
+      // Upload file using apollo-upload-client
+      const uploadResult = await uploadFile({
+        variables: { file },
+      });
+
+      console.log('Upload result:', uploadResult);
+
+      if (uploadResult.data?.uploadFile?.url) {
+        const imageUrl = uploadResult.data.uploadFile.url;
+
+        console.log('File uploaded, updating user profile with URL:', imageUrl);
+
+        // Update user profile with new image URL
+        await updateUser({
+          variables: {
+            id: userId,
+            input: {
+              profilePictureUrl: imageUrl,
+            },
+          },
+          refetchQueries: [{ query: ME_QUERY }],
+        });
+
+        console.log('✅ Profile image uploaded successfully:', imageUrl);
+        alert('Profile picture updated successfully!');
+      } else {
+        throw new Error('No URL returned from upload');
+      }
+    } catch (error: any) {
+      console.error('❌ Failed to upload profile image:', error);
+      console.error('Error details:', {
+        message: error.message,
+        graphQLErrors: error.graphQLErrors,
+        networkError: error.networkError,
+      });
+      alert(`Failed to upload image: ${error.message || 'Please try again.'}`);
+      setPreviewUrl(currentImageUrl || null);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: '24px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+        {previewUrl && (
+          <img
+            src={previewUrl}
+            alt="Profile"
+            style={{
+              width: '80px',
+              height: '80px',
+              borderRadius: '50%',
+              objectFit: 'cover',
+              border: '2px solid #e9ecef',
+            }}
+          />
+        )}
+        <div>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={handleFileChange}
+            disabled={uploading}
+            style={{ display: 'none' }}
+            id="profile-image-upload"
+          />
+          <label
+            htmlFor="profile-image-upload"
+            style={{
+              padding: '8px 16px',
+              fontSize: '14px',
+              backgroundColor: uploading ? '#ccc' : '#676FFF',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              cursor: uploading ? 'not-allowed' : 'pointer',
+              display: 'inline-block',
+            }}
+          >
+            {uploading ? 'Uploading...' : 'Upload Profile Picture'}
+          </label>
+          <p
+            style={{
+              fontSize: '12px',
+              color: '#666',
+              marginTop: '8px',
+              marginBottom: 0,
+            }}
+          >
+            Max 5MB, JPG/PNG
+          </p>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -144,6 +368,13 @@ function AuthComponent() {
 
     handleBackendLogin();
   }, [authenticated, backendUser, getAccessToken, loginMutation]);
+
+  // Sync meData with backendUser when profile is updated
+  useEffect(() => {
+    if (meData?.me) {
+      setBackendUser(meData.me);
+    }
+  }, [meData]);
 
   if (!ready) {
     return (
@@ -222,6 +453,12 @@ function AuthComponent() {
               >
                 📊 Backend User Profile
               </h3>
+
+              <ProfileImageUpload
+                userId={backendUser.id}
+                currentImageUrl={backendUser.profilePictureUrl}
+              />
+
               <div style={{ marginBottom: '12px' }}>
                 <strong>User ID:</strong> {backendUser.id}
               </div>
